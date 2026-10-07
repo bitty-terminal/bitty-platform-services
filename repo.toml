@@ -1,0 +1,17 @@
+# bitty-platform-services: workspace identity descriptor (kind/lang/role mirror workspace.toml).
+[repo]
+name = "bitty-platform-services"
+kind = "extension"
+lang = "rust"
+role = "L1 Rust Core Extension: platform notification bridge (Linux D-Bus, macOS notification center, Windows Toast), fail-closed"
+owner = "bitty-core"
+docs = "bitty-terminal-docs"
+
+[contracts.provides]
+platform-services = "crates/bitty-platform-services" # notification bridge: DesktopNotification/NotificationBackend/NotificationBridge, zero impl deps
+
+[contracts.consumes]
+platform-boundary = "bitty-docs: ADR-0016 Boundary 5" # platform-service adapter boundary; Core retains permission gate, validated args, redaction/rate bounds
+notification-contract = "bitty-terminal-docs: W-136" # focused platform-service contract (notification, URL, blur); this repo serves the notification slice
+notification-policy = "bitty#1763: OQ-076" # Core OSC 777 / Kitty parsing + RC-8 limiter lives in bitty; this crate consumes already-gated {title, body}
+rate-budget = "bitty-docs: RC-8 Isolation Resource RFC" # 10 events/s coalesced; Core enforces, this crate applies a defensive second cap

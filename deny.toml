@@ -1,0 +1,29 @@
+# Supply-chain approval for bitty-platform-services.
+#
+# The workspace has no external dependencies (zero-dependency bridge guarantee:
+# the notification API, trait, defensive limiter, and fail-closed backends are
+# std-only). Run `cargo deny check` to verify; CI enforces it (Supply chain job).
+
+[graph]
+features = []
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
