@@ -62,9 +62,12 @@ Signature overview (see crate rustdoc for the normative form):
 ## Status
 
 Initial bridge API at 0.0.1. Backends are fail-closed stubs behind the
-trait; no OS notification is emitted yet. Core integration (consent wiring,
-RC-8 admission before `notify`, banner composition) is a follow-up task in
-`bitty` under `bitty#1763`.
+trait; no OS notification is emitted yet. Core consumes the bridge for the
+defensive second cap (`bitty-runtime` holds a `NotificationBridge` with
+`NoopBackend`, CTX-1008 under `bitty#1763`): Core parses OSC 777 and Kitty
+notification sequences and enforces the RC-8 rate budget before anything here
+runs. Consent wiring, banner composition, and OS delivery stay follow-up work
+in `bitty`.
 
 ## Gates
 
