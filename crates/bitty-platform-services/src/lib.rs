@@ -15,14 +15,18 @@
 //!
 //! # Backends
 //!
-//! Per-platform backends sit behind [`NotificationBackend`]: Linux D-Bus
-//! [`LinuxDbusBackend`] (`org.freedesktop.Notifications`), macOS notification
-//! center [`MacosBackend`], Windows Toast [`WindowsToastBackend`], plus
-//! [`NoopBackend`] for headless runs and tests. Native D-Bus /
-//! notification-center / WinRT wiring awaits a scoped dependency decision and
-//! stays fail-closed until then: `is_available()` is false and `deliver()`
-//! returns [`SkipReason::BackendMissing`] without touching the OS. No shell
-//! is ever constructed or interpolated anywhere in the delivery path.
+//! Per-platform backends sit behind [`NotificationBackend`]: Linux
+//! [`LinuxDbusBackend`] (the `org.freedesktop.Notifications` service via its
+//! inbox command projection `notify-send`), macOS [`MacosBackend`]
+//! (notification center via inbox `osascript`), Windows
+//! [`WindowsToastBackend`] (Toast; still fail-closed: no inbox command-line
+//! toast path exists without a native WinRT dependency), plus [`NoopBackend`]
+//! for headless runs and tests. Linux and macOS delivery spawn a fixed argv
+//! (never a shell) with stdio nulled and hand the child to a bounded
+//! background reaper, so the caller never blocks; see [`LinuxDbusBackend`]
+//! and [`MacosBackend`] for the exact argv, timeouts, output handling, and
+//! failure mapping. No shell is ever constructed or interpolated anywhere in
+//! the delivery path.
 //!
 //! # Example
 //!
@@ -60,8 +64,9 @@ pub const DEFENSIVE_WINDOW: Duration = Duration::from_secs(1);
 
 /// Linux D-Bus destination for desktop notifications (spec-defined).
 ///
-/// Single home for the well-known name so future D-Bus wiring references one
-/// constant. No connection is opened today; the backend stays fail-closed.
+/// Single home for the well-known name. Delivery reaches this service through
+/// the inbox [`LINUX_NOTIFY_SEND`] command projection below; no D-Bus client
+/// is linked.
 pub const LINUX_DBUS_SERVICE: &str = "org.freedesktop.Notifications";
 
 /// Linux D-Bus object path for desktop notifications (spec-defined).
@@ -69,6 +74,48 @@ pub const LINUX_DBUS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 
 /// Linux D-Bus interface for desktop notifications (spec-defined).
 pub const LINUX_DBUS_INTERFACE: &str = "org.freedesktop.Notifications";
+
+/// Linux notification backend binary (absolute path, no `PATH` lookup).
+///
+/// `notify-send` is the inbox command-line projection of the
+/// [`LINUX_DBUS_SERVICE`] service above: no new dependency is linked, and a
+/// native D-Bus client stays an explicit non-goal until a scoped task
+/// authorizes one. An absent binary fails closed
+/// (`Skipped(BackendMissing)`).
+pub const LINUX_NOTIFY_SEND: &str = "/usr/bin/notify-send";
+
+/// Linux backend argv flag: application identity shown by the notifier.
+pub const LINUX_NOTIFY_APP_NAME: &str = "--app-name=bitty";
+
+/// Linux backend argv flag: banner-length expiry (4 s) matching the Core
+/// in-grid banner, so the OS surface and the terminal surface agree.
+pub const LINUX_NOTIFY_EXPIRE: &str = "--expire-time=4000";
+
+/// Fallback summary handed to the OS when the sanitized title is empty.
+///
+/// `OSC 9` carries no title; the OS call stays well-formed by naming Bitty.
+pub const NOTIFY_DEFAULT_SUMMARY: &str = "bitty";
+
+/// macOS notification backend binary (absolute path, no `PATH` lookup).
+///
+/// Inbox on every supported release; `terminal-notifier` would add an
+/// out-of-tree dependency, so `osascript` is the delivery contract.
+pub const MACOS_OSASCRIPT: &str = "/usr/bin/osascript";
+
+/// macOS backend argv flag: the following argv entry is a script expression.
+pub const MACOS_OSASCRIPT_EXPR_FLAG: &str = "-e";
+
+/// How long a spawned notifier child may run before the reaper kills it.
+///
+/// A hung notifier (wedged bus, suspended session) is killed, never left
+/// running, and never left a zombie.
+pub const NOTIFIER_REAP_WAIT: Duration = Duration::from_secs(2);
+
+/// Reaper poll interval while waiting for a notifier child.
+pub const NOTIFIER_REAP_POLL: Duration = Duration::from_millis(10);
+
+/// Background reaper thread name for spawned notifier children.
+pub const NOTIFIER_REAPER_THREAD_NAME: &str = "bitty-platform-services-notify-reap";
 
 /// A sanitized, length-bounded desktop notification.
 ///
@@ -206,14 +253,172 @@ impl NotificationBackend for NoopBackend {
     }
 }
 
-/// Linux backend: D-Bus `org.freedesktop.Notifications`.
+/// Fixed argv tail for `notify-send`: `[--app-name=bitty,
+/// --expire-time=4000, <SUMMARY>, <BODY>]`.
 ///
-/// Fail-closed stub: native D-Bus wiring awaits a scoped dependency decision
-/// (no D-Bus client is linked today), so `is_available()` is false and
-/// `deliver()` skips without touching the session bus. The spec-defined
-/// service constants above are the single home for the well-known name.
+/// `notify-send` takes `SUMMARY [BODY]` positionally; an empty title degrades
+/// to [`NOTIFY_DEFAULT_SUMMARY`] so the call stays well-formed. Entries are
+/// passed as literal argv items: shell metacharacters are never interpreted.
+fn linux_notify_argv(notification: &DesktopNotification) -> Vec<String> {
+    let summary = if notification.title().is_empty() {
+        String::from(NOTIFY_DEFAULT_SUMMARY)
+    } else {
+        String::from(notification.title())
+    };
+    vec![
+        String::from(LINUX_NOTIFY_APP_NAME),
+        String::from(LINUX_NOTIFY_EXPIRE),
+        summary,
+        String::from(notification.body()),
+    ]
+}
+
+/// Builds the `display notification` AppleScript expression with both
+/// interpolated strings quoted.
+///
+/// AppleScript has no escape inside double-quoted strings except `\"` (with
+/// backslashes doubled first), so a hostile payload can never break out of
+/// the quoted literal. No shell is involved either way: the script travels as
+/// a single `osascript -e` argv entry.
+fn osascript_notification_script(title: &str, body: &str) -> String {
+    fn quote(text: &str) -> String {
+        let mut quoted = String::with_capacity(text.len() + 2);
+        quoted.push('"');
+        for ch in text.chars() {
+            if ch == '\\' || ch == '"' {
+                quoted.push('\\');
+            }
+            quoted.push(ch);
+        }
+        quoted.push('"');
+        quoted
+    }
+    // `display notification` requires a message; an empty body degrades to
+    // the title so the call stays well-formed.
+    let message = if body.is_empty() { title } else { body };
+    if title.is_empty() || body.is_empty() {
+        format!(
+            "display notification {} with title \"{NOTIFY_DEFAULT_SUMMARY}\"",
+            quote(message)
+        )
+    } else {
+        format!(
+            "display notification {} with title {}",
+            quote(message),
+            quote(title)
+        )
+    }
+}
+
+/// Fixed argv for `osascript`: `-e <script>`, with the script from
+/// [`osascript_notification_script`] as one literal argv entry.
+fn macos_osascript_argv(notification: &DesktopNotification) -> Vec<String> {
+    vec![
+        String::from(MACOS_OSASCRIPT_EXPR_FLAG),
+        osascript_notification_script(notification.title(), notification.body()),
+    ]
+}
+
+/// Absolute-path backend presence probe (no `PATH` resolution).
+///
+/// Availability is a present-tense probe, never a guarantee: `deliver`
+/// re-probes immediately before spawning, so a binary removed in between
+/// still fails closed instead of resolving something else.
+fn backend_present(program: &str) -> bool {
+    std::path::Path::new(program).is_file()
+}
+
+/// Spawns `program` with fixed `args` (stdio nulled, never a shell) and hands
+/// the child to a bounded background reaper so the caller never blocks.
+///
+/// Returns `Delivered` once the child is handed to the reaper: the backend
+/// accepted the spawn, not proof that a banner is visible (the OS may still
+/// drop it silently, and the exit status is unobserved by design). Spawn
+/// failure is `Failed` with the I/O diagnostic. Child output is discarded:
+/// stdout and stderr are nulled, never read and never logged, so untrusted
+/// notification text cannot leak into logs through the delivery path.
+fn spawn_notifier(program: &str, args: &[String]) -> DeliveryOutcome {
+    use std::process::{Command, Stdio};
+    let spawn = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let child = match spawn {
+        Ok(child) => child,
+        Err(error) => return DeliveryOutcome::Failed(error.to_string()),
+    };
+    let (child_tx, child_rx) = std::sync::mpsc::channel::<std::process::Child>();
+    let program_name = String::from(program);
+    let reaper = std::thread::Builder::new()
+        .name(String::from(NOTIFIER_REAPER_THREAD_NAME))
+        .spawn(move || {
+            let Ok(mut child) = child_rx.recv() else {
+                return;
+            };
+            // Bounded wait: a hung notifier (wedged bus) is killed, never
+            // left running, and never left a zombie.
+            let waited = NOTIFIER_REAP_WAIT.as_millis() / NOTIFIER_REAP_POLL.as_millis().max(1);
+            for _ in 0..waited.max(1) {
+                match child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(NOTIFIER_REAP_POLL),
+                    Err(_) => break,
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = program_name;
+        });
+    match reaper {
+        Ok(_) => {
+            let _ = child_tx.send(child);
+            DeliveryOutcome::Delivered
+        }
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            DeliveryOutcome::Failed(error.to_string())
+        }
+    }
+}
+
+/// Linux backend: D-Bus `org.freedesktop.Notifications` via `notify-send`.
+///
+/// Delivery spawns [`LINUX_NOTIFY_SEND`] with the fixed argv from
+/// [`linux_notify_argv`]. stdio is nulled, no shell is constructed, and the
+/// child is handed to a bounded background reaper ([`NOTIFIER_REAP_WAIT`]
+/// wait at [`NOTIFIER_REAP_POLL`] intervals), so the caller never blocks.
+/// `notify-send` is the inbox command-line projection of the spec service
+/// ([`LINUX_DBUS_SERVICE`]); no D-Bus client is linked, so real delivery
+/// needed no new dependency and no `ffi` module.
+///
+/// Fail-closed mapping: a fully empty notification, a non-Linux platform, or
+/// a missing backend binary returns `Skipped(BackendMissing)` without
+/// spawning; spawn failure returns `Failed` with the I/O diagnostic; a
+/// successful reaper handoff returns `Delivered` (the backend accepted the
+/// spawn; the OS may still drop the banner silently).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxDbusBackend;
+
+impl LinuxDbusBackend {
+    /// Delivers through `program` instead of [`LINUX_NOTIFY_SEND`].
+    ///
+    /// Seam for the fake-based conformance suite: production always passes
+    /// the absolute inbox path. Same empty/probe/spawn mapping as
+    /// [`NotificationBackend::deliver`].
+    fn deliver_via(&self, program: &str, notification: &DesktopNotification) -> DeliveryOutcome {
+        if notification.is_empty() {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        if !backend_present(program) {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        spawn_notifier(program, &linux_notify_argv(notification))
+    }
+}
 
 impl NotificationBackend for LinuxDbusBackend {
     fn name(&self) -> &'static str {
@@ -221,21 +426,51 @@ impl NotificationBackend for LinuxDbusBackend {
     }
 
     fn is_available(&self) -> bool {
-        false
+        cfg!(target_os = "linux") && backend_present(LINUX_NOTIFY_SEND)
     }
 
-    fn deliver(&self, _notification: &DesktopNotification) -> DeliveryOutcome {
-        DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+    fn deliver(&self, notification: &DesktopNotification) -> DeliveryOutcome {
+        if !cfg!(target_os = "linux") {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        self.deliver_via(LINUX_NOTIFY_SEND, notification)
     }
 }
 
-/// macOS backend: notification center.
+/// macOS backend: notification center via `osascript`.
 ///
-/// Fail-closed stub: native notification-center wiring awaits a scoped
-/// dependency decision, so `is_available()` is false and `deliver()` skips
-/// without touching the OS.
+/// Delivery spawns [`MACOS_OSASCRIPT`] with the fixed argv from
+/// [`macos_osascript_argv`] (`-e` plus one AppleScript expression built by
+/// [`osascript_notification_script`] with hostile text quoted inside string
+/// literals). stdio is nulled, no shell is constructed, and the child is
+/// handed to a bounded background reaper ([`NOTIFIER_REAP_WAIT`] wait at
+/// [`NOTIFIER_REAP_POLL`] intervals), so the caller never blocks.
+/// `terminal-notifier` would add an out-of-tree dependency, so the inbox
+/// `osascript` is the delivery contract.
+///
+/// Fail-closed mapping mirrors [`LinuxDbusBackend`]: a fully empty
+/// notification, a non-macOS platform, or a missing backend binary returns
+/// `Skipped(BackendMissing)` without spawning; spawn failure returns `Failed`
+/// with the I/O diagnostic; a successful reaper handoff returns `Delivered`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MacosBackend;
+
+impl MacosBackend {
+    /// Delivers through `program` instead of [`MACOS_OSASCRIPT`].
+    ///
+    /// Seam for the fake-based conformance suite: production always passes
+    /// the absolute inbox path. Same empty/probe/spawn mapping as
+    /// [`NotificationBackend::deliver`].
+    fn deliver_via(&self, program: &str, notification: &DesktopNotification) -> DeliveryOutcome {
+        if notification.is_empty() {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        if !backend_present(program) {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        spawn_notifier(program, &macos_osascript_argv(notification))
+    }
+}
 
 impl NotificationBackend for MacosBackend {
     fn name(&self) -> &'static str {
@@ -243,19 +478,25 @@ impl NotificationBackend for MacosBackend {
     }
 
     fn is_available(&self) -> bool {
-        false
+        cfg!(target_os = "macos") && backend_present(MACOS_OSASCRIPT)
     }
 
-    fn deliver(&self, _notification: &DesktopNotification) -> DeliveryOutcome {
-        DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+    fn deliver(&self, notification: &DesktopNotification) -> DeliveryOutcome {
+        if !cfg!(target_os = "macos") {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
+        self.deliver_via(MACOS_OSASCRIPT, notification)
     }
 }
 
 /// Windows backend: Toast notifications.
 ///
-/// Fail-closed stub: native WinRT Toast wiring awaits a scoped dependency
-/// decision, so `is_available()` is false and `deliver()` skips without
-/// touching the OS.
+/// Fail-closed stub with an explicit gating gap: no inbox command-line toast
+/// path exists without a native WinRT dependency, so `is_available()` is
+/// false and `deliver()` returns `Skipped(BackendMissing)` without touching
+/// the OS. Wiring WinRT awaits a scoped dependency decision in an isolated
+/// `ffi` module with audit rows. Core-side retirement keeps the
+/// Windows-missing behavior on both sides, so this gap changes nothing there.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsToastBackend;
 
@@ -275,9 +516,11 @@ impl NotificationBackend for WindowsToastBackend {
 
 /// Returns the matching backend for the compilation target.
 ///
-/// Each arm is a fail-closed stub until native wiring lands; unknown targets
-/// resolve to [`NoopBackend`]. Callers must still handle
-/// [`SkipReason::BackendMissing`]: availability is platform-gated.
+/// The Linux and macOS arms deliver for real through their inbox helpers
+/// (still fail-closed when the helper is absent); Windows and unknown targets
+/// resolve to fail-closed stubs. Callers must still handle
+/// [`SkipReason::BackendMissing`]: availability is platform- and
+/// configuration-gated.
 #[must_use]
 pub fn platform_backend() -> Box<dyn NotificationBackend> {
     if cfg!(target_os = "linux") {
@@ -514,6 +757,252 @@ mod tests {
         assert_eq!(outcome, DeliveryOutcome::Delivered);
     }
 
+    /// Fake backend binary for delivery conformance (unix only).
+    ///
+    /// Installs an executable shell script that appends each argv entry on
+    /// its own line to a log file, so tests assert the exact argv the backend
+    /// would hand to the real helper without touching a desktop.
+    #[cfg(unix)]
+    struct FakeBackend {
+        dir: std::path::PathBuf,
+        program: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    static FAKE_BACKEND_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    #[cfg(unix)]
+    impl FakeBackend {
+        fn install() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let id = FAKE_BACKEND_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "bitty-platform-services-fake-{}-{id}",
+                std::process::id()
+            ));
+            let program = dir.join("fake-notify");
+            let log = dir.join("argv.log");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
+                log.to_string_lossy()
+            );
+            std::fs::create_dir_all(&dir).expect("fake backend dir");
+            std::fs::write(&program, script).expect("fake backend install");
+            let mut permissions = std::fs::metadata(&program)
+                .expect("fake backend metadata")
+                .permissions();
+            permissions.set_mode(0o750);
+            std::fs::set_permissions(&program, permissions).expect("fake backend chmod");
+            Self { dir, program, log }
+        }
+
+        fn program_string(&self) -> String {
+            self.program.to_string_lossy().into_owned()
+        }
+
+        fn logged_argv(&self) -> Vec<String> {
+            let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+            text.lines().map(String::from).collect()
+        }
+
+        fn spawned(&self) -> bool {
+            self.log.is_file()
+        }
+    }
+
+    /// Waits (bounded) for the fake backend child to record `want` argv
+    /// entries.
+    ///
+    /// Delivery hands the child to a background reaper and returns
+    /// immediately, so the fake script may not have run yet when the caller
+    /// reads the log. The fake answers in milliseconds; the multi-second
+    /// bound only trips on a genuine failure.
+    #[cfg(unix)]
+    fn await_logged_argv(fake: &FakeBackend, want: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let logged = fake.logged_argv();
+            if logged.len() >= want || std::time::Instant::now() >= deadline {
+                return logged;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn linux_argv_is_fixed_and_absolute() {
+        assert!(LINUX_NOTIFY_SEND.starts_with('/'));
+        assert!(!LINUX_NOTIFY_SEND.contains("PATH"));
+        let notification = DesktopNotification::new("Build", "done");
+        assert_eq!(
+            linux_notify_argv(&notification),
+            vec![
+                String::from(LINUX_NOTIFY_APP_NAME),
+                String::from(LINUX_NOTIFY_EXPIRE),
+                String::from("Build"),
+                String::from("done"),
+            ]
+        );
+        // No shell metacharacters are interpreted: hostile text stays a
+        // literal argv entry.
+        let hostile = DesktopNotification::new("$(id)", "`id`");
+        let hostile_args = linux_notify_argv(&hostile);
+        assert!(hostile_args.iter().any(|arg| arg == "$(id)"));
+        assert!(hostile_args.iter().any(|arg| arg == "`id`"));
+    }
+
+    #[test]
+    fn linux_untitled_notification_names_bitty() {
+        let notification = DesktopNotification::new("", "plain");
+        let args = linux_notify_argv(&notification);
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[2], NOTIFY_DEFAULT_SUMMARY);
+        assert_eq!(args[3], "plain");
+    }
+
+    #[test]
+    fn osascript_quoting_never_breaks_out() {
+        let hostile = "hi\"; do shell script \"rm -rf ~\"; \"\\bye";
+        let script = osascript_notification_script("t\"tle", hostile);
+        // Every interior quote/backslash is escaped: the script contains no
+        // bare hostile text, only escaped literals.
+        assert!(script.contains("\\\\"));
+        assert!(script.contains("\\\""));
+        assert!(script.starts_with("display notification"));
+        // The exact hostile text (with raw quotes) never appears verbatim.
+        assert!(!script.contains(hostile));
+    }
+
+    #[test]
+    fn osascript_empty_sides_stay_wellformed() {
+        let script = osascript_notification_script("", "hello");
+        assert!(script.contains("with title \"bitty\""));
+        let script = osascript_notification_script("title", "");
+        assert!(script.contains("display notification \"title\""));
+    }
+
+    #[test]
+    fn macos_argv_is_fixed_and_absolute() {
+        assert!(MACOS_OSASCRIPT.starts_with('/'));
+        let notification = DesktopNotification::new("Build", "done");
+        let args = macos_osascript_argv(&notification);
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], MACOS_OSASCRIPT_EXPR_FLAG);
+        assert!(args[1].starts_with("display notification"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_delivers_through_fake_backend() {
+        let fake = FakeBackend::install();
+        let notification = DesktopNotification::new("Build", "finished");
+        assert_eq!(
+            LinuxDbusBackend.deliver_via(&fake.program_string(), &notification),
+            DeliveryOutcome::Delivered
+        );
+        assert_eq!(
+            await_logged_argv(&fake, 4),
+            vec![
+                String::from(LINUX_NOTIFY_APP_NAME),
+                String::from(LINUX_NOTIFY_EXPIRE),
+                String::from("Build"),
+                String::from("finished"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_delivers_through_fake_backend() {
+        let fake = FakeBackend::install();
+        let notification = DesktopNotification::new("Build", "finished");
+        assert_eq!(
+            MacosBackend.deliver_via(&fake.program_string(), &notification),
+            DeliveryOutcome::Delivered
+        );
+        let logged = await_logged_argv(&fake, 2);
+        assert_eq!(logged.len(), 2);
+        assert_eq!(logged[0], MACOS_OSASCRIPT_EXPR_FLAG);
+        assert!(logged[1].starts_with("display notification"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_payload_reaches_fake_backend_only_as_literal_argv() {
+        let fake = FakeBackend::install();
+        let notification = DesktopNotification::new("$(id)", "`id`");
+        assert_eq!(
+            LinuxDbusBackend.deliver_via(&fake.program_string(), &notification),
+            DeliveryOutcome::Delivered
+        );
+        let logged = await_logged_argv(&fake, 4);
+        assert!(logged.iter().any(|arg| arg == "$(id)"));
+        assert!(logged.iter().any(|arg| arg == "`id`"));
+        // Had a shell expanded the payload, the log would hold command output
+        // instead of the literal text.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_notification_never_spawns() {
+        let fake = FakeBackend::install();
+        let program = fake.program_string();
+        let notification = DesktopNotification::new("", "");
+        assert_eq!(
+            LinuxDbusBackend.deliver_via(&program, &notification),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+        assert_eq!(
+            MacosBackend.deliver_via(&program, &notification),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+        assert!(!fake.spawned(), "empty notification must not spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_program_is_fail_closed_skip() {
+        let notification = DesktopNotification::new("t", "b");
+        assert_eq!(
+            LinuxDbusBackend.deliver_via("/nonexistent-bitty-backend-0123456789", &notification),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+        assert_eq!(
+            MacosBackend.deliver_via("/nonexistent-bitty-backend-0123456789", &notification),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unexecutable_file_reports_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-platform-services-unexec-{}",
+            std::process::id()
+        ));
+        let file = dir.join("not-executable");
+        std::fs::create_dir_all(&dir).expect("unexecutable fixture dir");
+        // Intentionally left non-executable: the presence probe passes (it is
+        // a file) but the spawn fails.
+        std::fs::write(&file, "not a program").expect("unexecutable fixture install");
+        let program = file.to_string_lossy().into_owned();
+        let notification = DesktopNotification::new("t", "b");
+        assert!(matches!(
+            LinuxDbusBackend.deliver_via(&program, &notification),
+            DeliveryOutcome::Failed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn noop_backend_never_touches_os() {
         let backend = NoopBackend;
@@ -526,30 +1015,39 @@ mod tests {
     }
 
     #[test]
-    fn stub_backends_are_fail_closed() {
+    fn windows_backend_stays_fail_closed() {
+        let backend = WindowsToastBackend;
+        assert!(!backend.is_available());
+        let notification = DesktopNotification::new("t", "b");
+        assert_eq!(
+            backend.deliver(&notification),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+    }
+
+    #[test]
+    fn linux_and_macos_backends_fail_closed_without_helper() {
+        // Never spawns the real helper: when the presence probe reports the
+        // helper absent, delivery must skip without touching the OS. (When the
+        // helper is present, real delivery is covered against fakes above.)
         for backend in [
             Box::new(LinuxDbusBackend) as Box<dyn NotificationBackend>,
             Box::new(MacosBackend),
-            Box::new(WindowsToastBackend),
-            Box::new(NoopBackend),
         ] {
-            assert!(
-                !backend.is_available(),
-                "{} must stay unavailable",
-                backend.name()
-            );
-            let notification = DesktopNotification::new("t", "b");
-            assert_eq!(
-                backend.deliver(&notification),
-                DeliveryOutcome::Skipped(SkipReason::BackendMissing),
-                "{} must fail closed",
-                backend.name()
-            );
+            if !backend.is_available() {
+                let notification = DesktopNotification::new("t", "b");
+                assert_eq!(
+                    backend.deliver(&notification),
+                    DeliveryOutcome::Skipped(SkipReason::BackendMissing),
+                    "{} must fail closed without its helper",
+                    backend.name()
+                );
+            }
         }
     }
 
     #[test]
-    fn platform_backend_matches_target_and_fails_closed() {
+    fn platform_backend_matches_target() {
         let backend = platform_backend();
         let expected = if cfg!(target_os = "linux") {
             "linux-dbus"
@@ -561,11 +1059,9 @@ mod tests {
             "noop"
         };
         assert_eq!(backend.name(), expected);
-        let notification = DesktopNotification::new("t", "b");
-        assert_eq!(
-            backend.deliver(&notification),
-            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
-        );
+        // Delivery itself is covered against fakes above; invoking the real
+        // helper here would touch a desktop, so selection asserts the name
+        // only (no real desktop needed in CI).
     }
 
     #[test]

@@ -51,23 +51,30 @@ Signature overview (see crate rustdoc for the normative form):
   fixed-window defensive limiter (default 10 admissions per 1 s, mirroring
   RC-8). `notify(title, body)` and `notify_parsed(&notification)` return
   `Skipped(RateLimited)` over the ceiling instead of queueing without bound.
-- Backends: `LinuxDbusBackend` (`org.freedesktop.Notifications`),
-  `MacosBackend` (notification center), `WindowsToastBackend` (Toast),
-  `NoopBackend` (always skips). `platform_backend()` returns the matching
-  backend for the compilation target. Native D-Bus / notification-center /
-  WinRT wiring awaits a scoped dependency decision and stays fail-closed
-  until then: `is_available()` is false and `deliver()` returns
-  `Skipped(BackendMissing)` without touching the OS.
+- Backends: `LinuxDbusBackend` (`org.freedesktop.Notifications` via inbox
+  `notify-send`), `MacosBackend` (notification center via inbox `osascript`),
+  `WindowsToastBackend` (Toast; still fail-closed: no inbox command-line toast
+  path without a native WinRT dependency), `NoopBackend` (always skips).
+  `platform_backend()` returns the matching backend for the compilation
+  target. Linux and macOS delivery spawns a fixed argv (never a shell) with
+  stdio nulled and hands the child to a bounded background reaper (2 s wait at
+  10 ms polls), so the caller never blocks; the full argv/timeout/output and
+  failure contract lives in `docs/backend-delivery-contract.md`. Absent
+  helpers stay fail-closed (`Skipped(BackendMissing)`).
 
 ## Status
 
-Initial bridge API at 0.0.1. Backends are fail-closed stubs behind the
-trait; no OS notification is emitted yet. Core consumes the bridge for the
-defensive second cap (`bitty-runtime` holds a `NotificationBridge` with
-`NoopBackend`, CTX-1008 under `bitty#1763`): Core parses OSC 777 and Kitty
-notification sequences and enforces the RC-8 rate budget before anything here
-runs. Consent wiring, banner composition, and OS delivery stay follow-up work
-in `bitty`.
+Bridge API plus real Linux/macOS delivery at 0.0.1. Linux delivers through
+inbox `notify-send` and macOS through inbox `osascript` (fixed argv, bounded
+reaper, no new dependencies); Windows stays fail-closed until a scoped
+dependency decision wires WinRT. Core consumes the bridge for the defensive
+second cap (`bitty-runtime` holds a `NotificationBridge` with `NoopBackend`,
+CTX-1008 under `bitty#1763`): Core parses OSC 777 and Kitty notification
+sequences and enforces the RC-8 rate budget before anything here runs.
+Retiring Core's second implementation (`OsNotificationSink`) is a Core-side
+follow-up tracked from platform-services#12; URL opening stays Core-owned
+permanently (`docs/url-open-ownership.md`). Consent wiring and banner
+composition stay follow-up work in `bitty`.
 
 ## Gates
 
