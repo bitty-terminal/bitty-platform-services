@@ -20,6 +20,9 @@ after the registry token rotation lands (see the Blockers section).
 - The registry token rotation recorded upstream is complete. Never publish
   with a token that may have been exposed; each publish is permanent
   (yank is the only undo).
+- Immediately before publishing, re-check that the crate name is still free
+  on the crates.io API. Names are first-come-first-served; the readiness
+  check above is point-in-time and the publish may run days after this note.
 - The working tree is clean and on `main`; the crate is unchanged since the
   dry-run verification above.
 
@@ -35,5 +38,8 @@ cargo publish -p bitty-platform-services
 
 - `cargo search bitty-platform-services --limit 1` shows the version once
   the index picks it up.
+- From a clean consumer project outside this workspace, declare
+  `bitty-platform-services = "=0.0.1"` under `[dependencies]`, then run
+  `cargo check`.
 - The crate page on crates.io shows "Builds on docs.rs" once the docs build
   finishes.
