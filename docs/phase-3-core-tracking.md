@@ -19,6 +19,11 @@ are touched here.
 
 `bitty#1763` is CLOSED via merged `bitty#1773` (CTX-1008,
 merge `1d6bae3`): Kitty OSC 99 parsing plus RC-8 plus bridge cap.
+Subsequently, `bitty#1998` (CTX-1178) retired Core's duplicate
+`OsNotificationSink` onto the real `LinuxDbusBackend` and `MacosBackend`
+implementations shipped in `bitty-platform-services#13` (CTX-0002),
+pinning `bitty-platform-services` at `7c6b84b` in
+`crates/bitty-runtime/Cargo.toml`.
 
 - Core parses OSC 777 notify plus Kitty OSC 99 sequences into
   title and body (chunk parser plus bounded assembler, base64 `e=1`;
@@ -29,41 +34,46 @@ merge `1d6bae3`): Kitty OSC 99 parsing plus RC-8 plus bridge cap.
 - Bell presentation (visual flash plus `terminal.bell`
   audible and visual via `BellSink`; no sink means counted-only).
 - Core consumes `bitty-platform-services` as a dependency at exact-rev
-  pin `2fc794a` (same pattern as `bitty-network-wire`), recorded in
-  `crates/bitty-runtime/Cargo.toml` and `Cargo.lock`.
-- No shell interpolation anywhere (fixed argv only).
-
-The pinned revision `2fc794a` is the bootstrap commit of this
-repository. The bridge API is unchanged since that pin: later commits
-here are docs-only (`22e13c4`) and toolchain (`944d065`). The pin
-therefore still resolves to the accepted bridge surface.
+  pin `7c6b84b`, recorded in `crates/bitty-runtime/Cargo.toml` and
+  `Cargo.lock`.
+- Headed runs install `platform_backend()` via
+  `Runtime::install_platform_notification_backend()`, while headless and
+  test runs keep `NoopBackend` by default so CI never touches the OS.
+- No shell interpolation anywhere (fixed argv with `--` option delimiter
+  on Linux `notify-send` and quoted AppleScript literal on macOS
+  `osascript`).
 
 ## How Core calls the bridge (read-only evidence)
 
 Read from the `bitty` checkout (no edits here):
 
 - `crates/bitty-runtime/src/runtime.rs`: `notification_bridge` held as
-  `bitty_platform_services::NotificationBridge` behind a cap-only
-  `NoopBackend`; admission builds
-  `DesktopNotification::new(title, body)` and over-ceiling maps to
-  `Skipped(RateLimited)`.
+  `bitty_platform_services::NotificationBridge` (defaulting to
+  `NoopBackend`, upgraded to `platform_backend()` in real headed runs via
+  `install_platform_notification_backend`); admission builds
+  `DesktopNotification::new(title, body)`, skips empty notifications, and
+  calls `notify_parsed_at(&bridge_notification, now)`. Over-ceiling maps
+  to `Skipped(RateLimited)`.
 - `crates/bitty-runtime/Cargo.toml`: `bitty-platform-services` at
-  `rev = "2fc794a"`.
-- `crates/bitty-runtime/tests/m1_kitty_notification.rs` (257 lines):
+  `rev = "7c6b84b"`.
+- `crates/bitty-runtime/tests/m1_kitty_notification.rs`:
   consent, assembly, base64, rapid RC-8, mixed budget, hostile
   sanitization, denied no-buffer. Existing `m1_bell_notification` and
-  `m1_bell_os_delivery` cover the bell path.
+  `m1_bell_os_delivery` cover the bell and OS delivery paths.
 - Unit coverage for the parser lives in `bitty-vt` (OSC 99
   title, body, chunked, base64, inert, ST handling; assembler single,
   chunked, empty, evict, bound).
 
 ## What this repository owns
 
-This repository defines the API Core consumes and applies the
-defensive second cap. It does not parse terminal output and does not
-enforce the primary RC-8 budget; Core does that before anything here
-runs. Backends stay fail-closed stubs until a scoped task authorizes a
-native dependency.
+This repository defines the API Core consumes, applies the defensive
+second cap, sanitizes `DesktopNotification` fields (stripping control and
+Unicode BiDi override characters, collapsing whitespace before enforcing
+`128`/`256` character bounds), and owns the per-platform delivery
+backends (`LinuxDbusBackend` via `/usr/bin/notify-send` with `--`
+end-of-options protection, `MacosBackend` via `/usr/bin/osascript` with
+escaped string literals, `WindowsToastBackend` fail-closed stub, and
+`NoopBackend`).
 
 ## Narrow file scope
 

@@ -1,31 +1,42 @@
 # Phase 4 verification: bridge security and Core composition
 
 Priority: P2 | Area: area:platform | Labels: feat,P2,area:platform
-| Milestone: v0.1.0 | RFC: W-136 | Task: CTX-0004
+| Milestone: v0.1.0 | RFC: W-136 | Task: CTX-0003
 
-Phase 4 independently verifies bridge security and Core composition.
-Scope is this repository only. Verification requires a different
-reviewer (no self-acceptance), negative-path evidence, canonical docs
-synchronization for W-136, no weakening of Core invariants, and green
-CI on the verification head. This PR is the review vehicle; it does
-not approve itself and does not merge itself.
+Phase 4 independently verifies bridge security and Core composition
+across the real Linux/macOS notification backends landed in PR #13
+(CTX-0002) and consumed by Bitty Core (`bitty#1998`, CTX-1178, pin
+`7c6b84b`).
 
 ## Negative-path evidence (all passing on this head)
 
-`cargo test` passes 10 unit tests plus 1 doctest. Negative paths:
+`cargo test` passes 24 unit tests plus 1 doctest. Negative paths:
 
-- Unavailable backends stay `BackendMissing`:
-  `stub_backends_are_fail_closed` asserts all four stubs report
-  `is_available() == false` and `deliver()` returns
-  `Skipped(BackendMissing)`; `platform_backend_matches_target_and_fails_closed`
-  asserts the target-selected backend fails closed;
-  `noop_backend_never_touches_os` asserts the no-op path.
-- Hostile payloads stay sanitized:
-  `sanitize_strips_controls_and_bounds_length` asserts control
-  stripping, whitespace collapse, and title 128 and body 256 bounds;
-  `hostile_payload_reaches_backend_only_sanitized` delivers shell
-  metacharacters, command substitution, and escape sequences through a
-  recording double and asserts only the sanitized form arrives.
+- Unavailable or stub backends stay `BackendMissing`:
+  `noop_backend_never_touches_os` and `windows_backend_stays_fail_closed`
+  assert `is_available() == false` and `deliver()` returns
+  `Skipped(BackendMissing)`; `missing_program_is_fail_closed_skip` and
+  `linux_and_macos_backends_fail_closed_without_helper` verify that
+  missing `/usr/bin/notify-send` or `/usr/bin/osascript` binaries fail
+  closed without spawning; `unexecutable_file_reports_failed` verifies
+  spawn failure returns `DeliveryOutcome::Failed(_)`.
+- Empty notifications never spawn and never consume rate budget:
+  `empty_notification_never_spawns` and
+  `empty_notification_does_not_consume_rate_budget` verify that
+  notifications whose title and body are empty (or sanitize to empty)
+  return `Skipped(BackendMissing)` before touching the rate limiter or OS.
+- Hostile payloads stay sanitized and cannot inject options or shell commands:
+  `sanitize_strips_controls_and_bounds_length` and
+  `sanitize_strips_bidi_overrides_and_collapses_before_truncation` assert
+  `Cc` control and Unicode BiDi override stripping, whitespace collapse
+  prior to truncation, and `128`/`256` character bounds;
+  `linux_argv_is_fixed_and_absolute` and
+  `hostile_payload_reaches_fake_backend_only_as_literal_argv` verify
+  `LINUX_NOTIFY_END_OPTIONS` (`"--"`) precedes positional summary/body
+  arguments so leading-dash payloads (`--wait`, `--icon=...`) and shell
+  metacharacters (`$(id)`, `` `id` ``) arrive only as literal positional
+  strings; `osascript_quoting_never_breaks_out` verifies backslash and
+  quote escaping inside `osascript -e`.
 - Defensive cap drops over-ceiling:
   `defensive_cap_admits_burst_then_drops_within_window` admits 10 then
   drops the 11th as `Skipped(RateLimited)` with `rate_dropped == 1`
@@ -38,14 +49,16 @@ not approve itself and does not merge itself.
 ## Security properties verified by inspection plus gates
 
 - `#![forbid(unsafe_code)]` in the crate. No `unwrap`, `expect`, or
-  `panic` in non-test code (the single `unwrap_or` in the file is
-  inside the test module). Typed errors and fail-closed outcomes only.
+  `panic` in non-test code. Typed errors and fail-closed outcomes only.
 - No shell construction or interpolation anywhere in the delivery path:
-  no `std::process`, no `Command`, no shell string in `src`. Backends
-  are fixed-trait dispatches returning typed outcomes.
-- Payloads are untrusted observation data: stripped, collapsed, and
-  bounded on construction; never expanded, executed, or interpreted as
-  paths or commands.
+  `spawn_notifier` invokes `/usr/bin/notify-send` or
+  `/usr/bin/osascript` directly via `std::process::Command::new` with a
+  fixed argv (`--` end-of-options on Linux; quoted string literals on
+  macOS), `Stdio::null()` for stdin/stdout/stderr, and a bounded 2 s
+  background reaper (`NOTIFIER_REAP_WAIT`).
+- Payloads are untrusted observation data: stripped of control and BiDi
+  formatting characters, whitespace-collapsed, and bounded on
+  construction; never expanded, executed, or logged.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
   passes with zero warnings. `cargo fmt --all -- --check` passes.
 
@@ -55,13 +68,13 @@ not approve itself and does not merge itself.
   (ADR-0016 Boundary 5). This crate executes only what Core
   authorizes: input is an already-gated `{title, body}` pair and the
   bridge applies a defensive second cap anyway.
-- `bitty#1763` closed via merged `bitty#1773` (CTX-1008): Core parses
-  OSC 777 and Kitty OSC 99, enforces RC-8 (10 per s, queue depth 8),
-  and holds a `NotificationBridge` with `NoopBackend` as a cap-only
-  gate. This crate never grants permission, never bypasses consent,
-  and never replaces Core redaction or rate bounds.
-- Platform FFI is not wired: backends stay fail-closed stubs until a
-  scoped task authorizes a native dependency in an isolated `ffi`
+- `bitty#1763` closed via merged `bitty#1773` (CTX-1008) and `bitty#1998`
+  (CTX-1178) retired Core's duplicate `OsNotificationSink` onto
+  `NotificationBridge::install_platform_notification_backend()`. Core
+  never grants permission here, never bypasses consent, and never
+  replaces Core redaction or rate bounds.
+- Windows Toast remains a fail-closed stub (`WindowsToastBackend`) until a
+  scoped task authorizes a native WinRT dependency in an isolated `ffi`
   module with audit rows.
 
 ## Canonical docs synchronization (W-136)
