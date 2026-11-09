@@ -91,6 +91,10 @@ pub const LINUX_NOTIFY_APP_NAME: &str = "--app-name=bitty";
 /// in-grid banner, so the OS surface and the terminal surface agree.
 pub const LINUX_NOTIFY_EXPIRE: &str = "--expire-time=4000";
 
+/// Linux backend argv delimiter ending option parsing before positional
+/// summary/body arguments so leading `-` payloads are never parsed as flags.
+pub const LINUX_NOTIFY_END_OPTIONS: &str = "--";
+
 /// Fallback summary handed to the OS when the sanitized title is empty.
 ///
 /// `OSC 9` carries no title; the OS call stays well-formed by naming Bitty.
@@ -163,15 +167,50 @@ impl DesktopNotification {
     }
 }
 
-/// Strips control characters, collapses whitespace runs, and truncates to
-/// `max_chars` characters.
+/// Whether `ch` is a Unicode bidirectional formatting/override character
+/// (`ALM`, `LRM`, `RLM`, `LRE`..`RLO`, `LRI`..`PDI`) that could spoof text
+/// direction in a desktop notification banner.
+const fn is_bidi_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Strips control and BiDi formatting characters, collapses whitespace runs,
+/// and truncates to `max_chars` characters after whitespace normalization.
 fn sanitize_field(raw: &str, max_chars: usize) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(max_chars)
-        .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in raw.chars() {
+        if ch.is_control() || is_bidi_format(ch) {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if pending_space {
+            if count + 1 >= max_chars {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        out.push(ch);
+        count += 1;
+        if count >= max_chars {
+            break;
+        }
+    }
+    out
 }
 
 /// Why a delivery attempt was skipped without touching the OS.
@@ -254,11 +293,13 @@ impl NotificationBackend for NoopBackend {
 }
 
 /// Fixed argv tail for `notify-send`: `[--app-name=bitty,
-/// --expire-time=4000, <SUMMARY>, <BODY>]`.
+/// --expire-time=4000, --, <SUMMARY>, <BODY>]`.
 ///
-/// `notify-send` takes `SUMMARY [BODY]` positionally; an empty title degrades
-/// to [`NOTIFY_DEFAULT_SUMMARY`] so the call stays well-formed. Entries are
-/// passed as literal argv items: shell metacharacters are never interpreted.
+/// `notify-send` takes `SUMMARY [BODY]` positionally; `--` ends option parsing
+/// so a summary or body starting with `-` is never interpreted as a flag, and
+/// an empty title degrades to [`NOTIFY_DEFAULT_SUMMARY`] so the call stays
+/// well-formed. Entries are passed as literal argv items: shell metacharacters
+/// are never interpreted.
 fn linux_notify_argv(notification: &DesktopNotification) -> Vec<String> {
     let summary = if notification.title().is_empty() {
         String::from(NOTIFY_DEFAULT_SUMMARY)
@@ -268,6 +309,7 @@ fn linux_notify_argv(notification: &DesktopNotification) -> Vec<String> {
     vec![
         String::from(LINUX_NOTIFY_APP_NAME),
         String::from(LINUX_NOTIFY_EXPIRE),
+        String::from(LINUX_NOTIFY_END_OPTIONS),
         summary,
         String::from(notification.body()),
     ]
@@ -656,6 +698,9 @@ impl NotificationBridge {
         notification: &DesktopNotification,
         now: Instant,
     ) -> DeliveryOutcome {
+        if notification.is_empty() {
+            return DeliveryOutcome::Skipped(SkipReason::BackendMissing);
+        }
         if !self.limiter.admit_at(now) {
             self.rate_dropped = self.rate_dropped.saturating_add(1);
             return DeliveryOutcome::Skipped(SkipReason::RateLimited);
@@ -740,11 +785,44 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_bidi_overrides_and_collapses_before_truncation() {
+        let padded = format!(
+            "{}\u{202e}Build \u{2066}failed\u{2069}",
+            " ".repeat(TITLE_MAX_CHARS + 32)
+        );
+        let notification = DesktopNotification::new(&padded, &padded);
+        assert_eq!(notification.title(), "Build failed");
+        assert_eq!(notification.body(), "Build failed");
+        assert!(!notification.title().contains('\u{202e}'));
+    }
+
+    #[test]
     fn empty_sides_degrade() {
         let notification = DesktopNotification::new("", "");
         assert!(notification.is_empty());
         assert!(!DesktopNotification::new("t", "").is_empty());
         assert!(!DesktopNotification::new("", "b").is_empty());
+    }
+
+    #[test]
+    fn empty_notification_does_not_consume_rate_budget() {
+        let config = BridgeConfig::new(1, DEFENSIVE_WINDOW);
+        let mut bridge =
+            NotificationBridge::with_config(Box::new(RecordingBackend::available()), config);
+        let now = Instant::now();
+        let empty = DesktopNotification::new(" \t\n\u{202e} ", "");
+        assert!(empty.is_empty());
+        assert_eq!(
+            bridge.notify_parsed_at(&empty, now),
+            DeliveryOutcome::Skipped(SkipReason::BackendMissing)
+        );
+        let real = DesktopNotification::new("Build", "done");
+        assert_eq!(
+            bridge.notify_parsed_at(&real, now),
+            DeliveryOutcome::Delivered
+        );
+        assert_eq!(bridge.delivered(), 1);
+        assert_eq!(bridge.rate_dropped(), 0);
     }
 
     #[test]
@@ -848,25 +926,28 @@ mod tests {
             vec![
                 String::from(LINUX_NOTIFY_APP_NAME),
                 String::from(LINUX_NOTIFY_EXPIRE),
+                String::from(LINUX_NOTIFY_END_OPTIONS),
                 String::from("Build"),
                 String::from("done"),
             ]
         );
-        // No shell metacharacters are interpreted: hostile text stays a
-        // literal argv entry.
-        let hostile = DesktopNotification::new("$(id)", "`id`");
+        // No shell metacharacters or leading-dash options are interpreted:
+        // `--` precedes positional summary/body entries.
+        let hostile = DesktopNotification::new("--wait $(id)", "--icon=/etc/passwd `id`");
         let hostile_args = linux_notify_argv(&hostile);
-        assert!(hostile_args.iter().any(|arg| arg == "$(id)"));
-        assert!(hostile_args.iter().any(|arg| arg == "`id`"));
+        assert_eq!(hostile_args[2], LINUX_NOTIFY_END_OPTIONS);
+        assert_eq!(hostile_args[3], "--wait $(id)");
+        assert_eq!(hostile_args[4], "--icon=/etc/passwd `id`");
     }
 
     #[test]
     fn linux_untitled_notification_names_bitty() {
         let notification = DesktopNotification::new("", "plain");
         let args = linux_notify_argv(&notification);
-        assert_eq!(args.len(), 4);
-        assert_eq!(args[2], NOTIFY_DEFAULT_SUMMARY);
-        assert_eq!(args[3], "plain");
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[2], LINUX_NOTIFY_END_OPTIONS);
+        assert_eq!(args[3], NOTIFY_DEFAULT_SUMMARY);
+        assert_eq!(args[4], "plain");
     }
 
     #[test]
@@ -910,10 +991,11 @@ mod tests {
             DeliveryOutcome::Delivered
         );
         assert_eq!(
-            await_logged_argv(&fake, 4),
+            await_logged_argv(&fake, 5),
             vec![
                 String::from(LINUX_NOTIFY_APP_NAME),
                 String::from(LINUX_NOTIFY_EXPIRE),
+                String::from(LINUX_NOTIFY_END_OPTIONS),
                 String::from("Build"),
                 String::from("finished"),
             ]
@@ -944,7 +1026,8 @@ mod tests {
             LinuxDbusBackend.deliver_via(&fake.program_string(), &notification),
             DeliveryOutcome::Delivered
         );
-        let logged = await_logged_argv(&fake, 4);
+        let logged = await_logged_argv(&fake, 5);
+        assert_eq!(logged[2], LINUX_NOTIFY_END_OPTIONS);
         assert!(logged.iter().any(|arg| arg == "$(id)"));
         assert!(logged.iter().any(|arg| arg == "`id`"));
         // Had a shell expanded the payload, the log would hold command output
